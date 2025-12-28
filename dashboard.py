@@ -282,20 +282,49 @@ def main():
                 nav_change = data['change_in_nav']
                 starting_value = nav_change.get('Starting Value', 0)
                 ending_value = nav_change.get('Ending Value', 0)
-                realized_pl = nav_change.get('Realized P/L', 0)
-                unrealized_pl = nav_change.get('Change in Unrealized P/L', 0)
+
+                # Handle both "Realized Summary" and "Activity Statement" formats
+                # Realized Summary format has: Realized P/L, Change in Unrealized P/L
+                # Activity Statement format has: Mark-to-Market
+                is_activity_statement = 'Mark-to-Market' in nav_change
+
+                if 'Realized P/L' in nav_change:
+                    # Realized Summary format
+                    realized_pl = nav_change.get('Realized P/L', 0)
+                    unrealized_pl = nav_change.get('Change in Unrealized P/L', 0)
+                    realized_label = "Realized P/L"
+                    unrealized_label = "Unrealized P/L"
+                elif is_activity_statement:
+                    # Activity Statement format - Mark-to-Market is total P/L
+                    mark_to_market = nav_change.get('Mark-to-Market', 0)
+                    # For Activity Statement, we don't have separate realized/unrealized breakdown
+                    # Mark-to-Market represents total performance
+                    realized_pl = mark_to_market  # Use as total P/L
+                    unrealized_pl = 0  # Not available in Activity Statement format
+                    realized_label = "Mark-to-Market P/L"
+                    unrealized_label = "Unrealized P/L (N/A)"
+                else:
+                    # Fallback
+                    realized_pl = 0
+                    unrealized_pl = 0
+                    realized_label = "Realized P/L"
+                    unrealized_label = "Unrealized P/L"
+
                 deposits = nav_change.get('Deposits & Withdrawals', 0)
 
                 with col1:
                     st.metric("Ending Value", format_currency(ending_value))
 
                 with col2:
-                    st.metric("Realized P/L", format_currency(realized_pl),
+                    st.metric(realized_label, format_currency(realized_pl),
                              delta=f"{realized_pl/starting_value*100:.2f}%" if starting_value > 0 else "0%")
 
                 with col3:
-                    st.metric("Unrealized P/L", format_currency(unrealized_pl),
-                             delta=f"{unrealized_pl/starting_value*100:.2f}%" if starting_value > 0 else "0%")
+                    if is_activity_statement:
+                        st.metric(unrealized_label, "N/A")
+                    else:
+                        st.metric(unrealized_label, format_currency(unrealized_pl),
+                                 delta=f"{unrealized_pl/starting_value*100:.2f}%" if starting_value > 0 else "0%")
 
                 with col4:
                     total_pl = realized_pl + unrealized_pl

@@ -41,15 +41,18 @@ class IBKRStatementParser:
         in_section = False
 
         for row in self.raw_data:
-            if len(row) > 0 and row[0] == section_name:
-                if len(row) > 1 and row[1] == 'Header':
-                    in_section = True
-                    continue
-                elif in_section:
-                    if len(row) > 1 and row[1] == 'Data':
-                        section_data.append(row)
-                    elif len(row) > 0 and row[0] != section_name:
-                        break
+            if len(row) > 0:
+                # Strip BOM and whitespace from section name
+                row_section = row[0].lstrip('\ufeff').strip()
+                if row_section == section_name:
+                    if len(row) > 1 and row[1] == 'Header':
+                        in_section = True
+                        continue
+                    elif in_section:
+                        if len(row) > 1 and row[1] == 'Data':
+                            section_data.append(row)
+                        elif len(row) > 0 and row_section != section_name:
+                            break
 
         return section_data
 

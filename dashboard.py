@@ -46,11 +46,12 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_data
+@st.cache_data(show_spinner="Parsing IBKR statement...")
 def load_data(csv_path: str):
     """Load and parse IBKR statement data."""
     parser = IBKRStatementParser(csv_path)
-    return parser.parse()
+    data = parser.parse()
+    return data
 
 
 def save_uploaded_file(uploaded_file):
@@ -199,10 +200,13 @@ def main():
                 st.sidebar.write(f"**Name:** {account.get('Name', 'N/A')}")
                 st.sidebar.write(f"**Type:** {account.get('Account Type', 'N/A')}")
 
-            # Statement period
-            if 'statement' in data:
-                st.sidebar.markdown("### Statement Period")
-                st.sidebar.write(data['statement'].get('Period', 'N/A'))
+            # Statement period - only show if we have valid period data
+            if 'statement' in data and isinstance(data['statement'], dict):
+                period = data['statement'].get('Period')
+                if period and period.strip() and period != 'N/A':
+                    st.sidebar.markdown("### Statement Period")
+                    st.sidebar.write(period)
+                # If period is not available, don't show this section at all
 
             # Export section
             st.sidebar.markdown("---")

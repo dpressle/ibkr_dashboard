@@ -12,6 +12,7 @@ from pathlib import Path
 from datetime import datetime, date
 import io
 import tempfile
+import re
 
 # Page configuration
 st.set_page_config(
@@ -683,6 +684,100 @@ def main():
                 positions_df = data['open_positions']
 
                 if not positions_df.empty:
+                    # Categorize positions for stacked bar chart
+                    def categorize_position(row):
+                        """Categorize position into Cash Secured Puts, Stocks, LEAPS, or Other Options."""
+                        asset_cat = row.get('Asset Category', '')
+                        symbol = str(row.get('Symbol', ''))
+                        quantity = row.get('Quantity', 0)
+                        
+                        # Stocks
+                        if asset_cat == 'Stocks':
+                            return 'Stocks'
+                        
+                        # Options
+                        if asset_cat == 'Equity and Index Options':
+                            # Check if it's a put (ends with P or contains " P")
+                            is_put = symbol.endswith(' P') or symbol.endswith('P')
+                            
+                            # Cash secured puts: short puts (negative quantity)
+                            if is_put and quantity < 0:
+                                return 'Cash Secured Puts'
+                            
+                            # LEAPS: options expiring in 2027 or later (typically > 1 year)
+                            # Extract date from symbol (format: SYMBOL DDMMMYY STRIKE P/C)
+                            # Example: "IREN 15JAN27 42 C" -> 2027
+                            # Example: "SOFI 17JUN27 20 C" -> 2027 (LEAPS)
+                            # Example: "INOD 27FEB26 60 C" -> 2026 Feb (NOT LEAPS)
+                            date_match = re.search(r'(\d{2})([A-Z]{3})(\d{2})', symbol)
+                            if date_match:
+                                day = date_match.group(1)
+                                month_str = date_match.group(2)
+                                year_str = date_match.group(3)
+                                year = int('20' + year_str)
+                                
+                                # Convert month abbreviation to number
+                                months = {'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
+                                         'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12}
+                                month_num = months.get(month_str, 0)
+                                
+                                # LEAPS are typically > 1 year, so 2027+ or December 2026
+                                if year >= 2027 or (year == 2026 and month_num >= 12):
+                                    return 'LEAPS'
+                            
+                            # Other options
+                            return 'Other Options'
+                        
+                        return 'Other'
+                    
+                    # Add category column
+                    positions_df['Position_Category'] = positions_df.apply(categorize_position, axis=1)
+                    
+                    # Calculate collateral for CSP positions
+                    def extract_strike(symbol):
+                        """Extract strike price from option symbol."""
+                        try:
+                            parts = symbol.split()
+                            if len(parts) >= 3:
+                                strike_str = parts[-2]
+                                try:
+                                    return float(strike_str)
+                                except ValueError:
+                                    for i in range(len(parts) - 2, -1, -1):
+                                        try:
+                                            return float(parts[i])
+                                        except ValueError:
+                                            continue
+                            return 0
+                        except:
+                            return 0
+                    
+                    # Add collateral calculation
+                    positions_df['Collateral'] = 0
+                    csp_mask = positions_df['Position_Category'] == 'Cash Secured Puts'
+                    if csp_mask.any():
+                        csp_positions = positions_df[csp_mask].copy()
+                        csp_positions['Strike'] = csp_positions['Symbol'].apply(extract_strike)
+                        if 'Mult' in csp_positions.columns:
+                            csp_positions['Multiplier'] = csp_positions['Mult'].fillna(100)
+                        else:
+                            csp_positions['Multiplier'] = 100
+                        csp_positions['Abs_Quantity'] = csp_positions['Quantity'].abs()
+                        csp_positions['Collateral'] = csp_positions['Strike'] * csp_positions['Abs_Quantity'] * csp_positions['Multiplier']
+                        
+                        # Update collateral in main dataframe
+                        positions_df.loc[csp_mask, 'Collateral'] = csp_positions['Collateral'].values
+                    
+                    # Calculate totals by category
+                    category_summary = positions_df.groupby('Position_Category').agg({
+                        'Value': 'sum',
+                        'Cost Basis': 'sum',
+                        'Unrealized P/L': 'sum',
+                        'Collateral': 'sum',
+                        'Quantity': 'count'  # Count of positions
+                    }).reset_index()
+                    category_summary.columns = ['Category', 'Total Value', 'Total Cost Basis', 'Total Unrealized P/L', 'Total Collateral', 'Position Count']
+                    
                     # Summary by asset category
                     pos_summary = positions_df.groupby('Asset Category').agg({
                         'Quantity': 'sum',
@@ -708,12 +803,208 @@ def main():
                             color_continuous_scale=['red', 'yellow', 'green']
                         )
                         st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Stacked bar chart: One bar per stock, normalized to 100% per bar
+                    st.subheader("Portfolio Allocation by Stock - Stacked Position Types")
+                    
+                    # Get total portfolio value from NAV
+                    nav_total = nav_df[nav_df['Asset Class'] == 'Total']['Current Total'].iloc[0] if 'Total' in nav_df['Asset Class'].values else 0
+                    nav_cash = nav_df[nav_df['Asset Class'] == 'Cash ']['Current Total'].iloc[0] if 'Cash ' in nav_df['Asset Class'].values else 0
+                    
+                    # Extract underlying symbol for each position
+                    def get_underlying_symbol(row):
+                        """Extract underlying symbol from position."""
+                        symbol = str(row['Symbol'])
+                        asset_cat = row.get('Asset Category', '')
+                        
+                        if asset_cat == 'Stocks':
+                            return symbol
+                        else:
+                            # For options, extract underlying (first part before space)
+                            parts = symbol.split()
+                            return parts[0] if parts else symbol
+                    
+                    positions_df['Underlying'] = positions_df.apply(get_underlying_symbol, axis=1)
+                    
+                    # Group by underlying symbol and position category, sum values and collateral
+                    position_summary = positions_df.groupby(['Underlying', 'Position_Category']).agg({
+                        'Value': 'sum',
+                        'Collateral': 'sum'
+                    }).reset_index()
+                    
+                    # Calculate total value and collateral per symbol
+                    symbol_totals = position_summary.groupby('Underlying').agg({
+                        'Value': 'sum',
+                        'Collateral': 'sum'
+                    }).reset_index()
+                    symbol_totals.columns = ['Underlying', 'Total_Value', 'Total_Collateral']
+                    
+                    # For normalization: use collateral for CSP-only stocks, value for others
+                    symbol_totals['Total_Value_Abs'] = symbol_totals.apply(
+                        lambda row: row['Total_Collateral'] if row['Total_Value'] < 0 and row['Total_Collateral'] > 0 
+                                   else abs(row['Total_Value']),
+                        axis=1
+                    )
+                    
+                    # Calculate percentage of portfolio for each symbol (for labels)
+                    symbol_totals['Portfolio_Percentage'] = (symbol_totals['Total_Value_Abs'] / nav_total * 100) if nav_total > 0 else 0
+                    
+                    # Sort by portfolio percentage descending
+                    symbol_totals = symbol_totals.sort_values('Portfolio_Percentage', ascending=False)
+                    all_symbols = symbol_totals['Underlying'].tolist()
+                    
+                    # Define colors - softer, easier on the eyes
+                    colors = {
+                        'Stocks': '#2E7D32',  # Darker green (easier on eyes)
+                        'Cash Secured Puts': '#F57C00',  # Darker orange
+                        'LEAPS': '#C62828',  # Darker red
+                        'Other Options': '#FF8A65',  # Softer orange
+                        'Other': '#78909C'  # Softer grey
+                    }
+                    
+                    # Create stacked bar chart - scaled by portfolio percentage with visibility factor
+                    fig = go.Figure()
+                    
+                    # Calculate scaling factor to make small positions visible
+                    # Use square root scaling: scaled_height = sqrt(percentage) * factor
+                    # This makes small percentages more visible relative to large ones
+                    max_pct = symbol_totals['Portfolio_Percentage'].max()
+                    min_pct = symbol_totals[symbol_totals['Portfolio_Percentage'] > 0]['Portfolio_Percentage'].min()
+                    
+                    # Calculate scaling factor: ensure smallest position is at least 5% of max bar height
+                    if min_pct > 0:
+                        # Scale so min_pct becomes visible (e.g., 5% of max bar)
+                        scale_factor = 100 / (max_pct ** 0.5)  # Square root scaling
+                        min_visible_height = (min_pct ** 0.5) * scale_factor
+                        if min_visible_height < 5:  # Ensure minimum 5% visibility
+                            scale_factor = 5 / (min_pct ** 0.5)
+                    else:
+                        scale_factor = 1
+                    
+                    # Order of stacking: Stocks on top, then Cash Secured Puts, then LEAPS
+                    # Note: Other Options are hidden from the chart
+                    stack_order = ['Stocks', 'Cash Secured Puts', 'LEAPS']
+                    
+                    for position_type in stack_order:
+                        scaled_heights = []  # Scaled heights based on portfolio percentage
+                        normalized_percentages = []  # Percentage within each stock (for reference)
+                        portfolio_percentages = []  # Percentage of total portfolio
+                        values_list = []
+                        collateral_list = []
+                        
+                        for symbol in all_symbols:
+                            symbol_data = position_summary[
+                                (position_summary['Underlying'] == symbol) & 
+                                (position_summary['Position_Category'] == position_type)
+                            ]
+                            value = symbol_data['Value'].sum() if not symbol_data.empty else 0
+                            collateral = symbol_data['Collateral'].sum() if not symbol_data.empty else 0
+                            
+                            # Get total value for this symbol (use absolute value for normalization)
+                            symbol_total_abs = symbol_totals[symbol_totals['Underlying'] == symbol]['Total_Value_Abs'].iloc[0]
+                            
+                            # For CSP positions, use collateral instead of value for display
+                            if position_type == 'Cash Secured Puts':
+                                display_value = collateral if collateral > 0 else abs(value)
+                            else:
+                                display_value = abs(value)
+                            
+                            # Calculate percentage within this stock (for hover info)
+                            normalized_pct = (display_value / symbol_total_abs * 100) if symbol_total_abs > 0 else 0
+                            normalized_percentages.append(normalized_pct)
+                            
+                            # Portfolio percentage - use collateral for CSP, value for others
+                            if position_type == 'Cash Secured Puts':
+                                portfolio_pct = (collateral / nav_total * 100) if nav_total > 0 else 0
+                            else:
+                                portfolio_pct = (display_value / nav_total * 100) if nav_total > 0 else 0
+                            portfolio_percentages.append(portfolio_pct)
+                            
+                            # Calculate scaled height for this segment
+                            # Use square root scaling to make small values more visible
+                            if portfolio_pct > 0:
+                                scaled_height = (portfolio_pct ** 0.5) * scale_factor
+                            else:
+                                scaled_height = 0
+                            
+                            # But we need to scale proportionally within each bar
+                            # So calculate what portion of the bar this segment represents
+                            symbol_total_pct = symbol_totals[symbol_totals['Underlying'] == symbol]['Portfolio_Percentage'].iloc[0]
+                            symbol_scaled_height = (symbol_total_pct ** 0.5) * scale_factor if symbol_total_pct > 0 else 0
+                            
+                            # Segment height = (segment_pct / total_pct) * symbol_scaled_height
+                            segment_height = (portfolio_pct / symbol_total_pct * symbol_scaled_height) if symbol_total_pct > 0 else 0
+                            scaled_heights.append(segment_height)
+                            
+                            values_list.append(value)
+                            collateral_list.append(collateral)
+                        
+                        # Only add trace if there are non-zero values
+                        if any(h > 0 for h in scaled_heights):
+                            # Custom hover template for CSP to show collateral
+                            if position_type == 'Cash Secured Puts':
+                                hover_template = f"<b>%{{x}}</b><br>" + \
+                                               f"Type: {position_type}<br>" + \
+                                               f"Within Stock: %{{customdata[3]:.1f}}%<br>" + \
+                                               f"Of Portfolio: %{{customdata[0]:.2f}}%<br>" + \
+                                               f"Collateral: $%{{customdata[2]:,.2f}}<br>" + \
+                                               f"Option Value: $%{{customdata[1]:,.2f}}<extra></extra>"
+                            else:
+                                hover_template = f"<b>%{{x}}</b><br>" + \
+                                               f"Type: {position_type}<br>" + \
+                                               f"Within Stock: %{{customdata[3]:.1f}}%<br>" + \
+                                               f"Of Portfolio: %{{customdata[0]:.2f}}%<br>" + \
+                                               f"Value: $%{{customdata[1]:,.2f}}<extra></extra>"
+                            
+                            fig.add_trace(go.Bar(
+                                name=position_type,
+                                x=all_symbols,
+                                y=scaled_heights,  # Use scaled heights based on portfolio percentage
+                                marker_color=colors.get(position_type, '#95A5A6'),
+                                hovertemplate=hover_template,
+                                customdata=list(zip(portfolio_percentages, values_list, collateral_list, normalized_percentages))
+                            ))
+                    
+                    # Calculate max bar height for y-axis range (excluding cash)
+                    max_bar_height = symbol_totals['Portfolio_Percentage'].apply(lambda p: (p ** 0.5) * scale_factor).max()
+                    
+                    # Add portfolio percentage labels above bars
+                    annotations = []
+                    for symbol in all_symbols:
+                        portfolio_pct = symbol_totals[symbol_totals['Underlying'] == symbol]['Portfolio_Percentage'].iloc[0]
+                        symbol_scaled_height = (portfolio_pct ** 0.5) * scale_factor if portfolio_pct > 0 else 0
+                        annotations.append(dict(
+                            x=symbol,
+                            y=symbol_scaled_height,
+                            text=f'{portfolio_pct:.2f}%',
+                            showarrow=False,
+                            font=dict(color='white', size=10),
+                            yshift=10
+                        ))
+                    
+                    
+                    fig.update_layout(
+                        title="Portfolio Allocation by Stock - Scaled by Portfolio % (Square Root Scaling)",
+                        xaxis_title="Stock Symbol",
+                        yaxis_title="Scaled Height (Proportional to Portfolio %)",
+                        barmode='stack',
+                        showlegend=True,
+                        height=600,
+                        xaxis=dict(tickangle=-45),
+                        yaxis=dict(range=[0, max_bar_height * 1.1], title="Scaled Height"),
+                        annotations=annotations
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
 
                     # Detailed positions table
                     st.subheader("Detailed Positions")
                     display_pos = positions_df[['Asset Category', 'Symbol', 'Quantity',
-                                               'Cost Basis', 'Value', 'Unrealized P/L']].copy()
+                                               'Cost Basis', 'Value', 'Unrealized P/L', 'Position_Category']].copy()
                     display_pos = display_pos.sort_values('Unrealized P/L', ascending=False)
+                    # Reorder columns to show category first
+                    cols = ['Position_Category', 'Asset Category', 'Symbol', 'Quantity', 'Cost Basis', 'Value', 'Unrealized P/L']
+                    display_pos = display_pos[[c for c in cols if c in display_pos.columns]]
+                    display_pos.columns = ['Category', 'Asset Type', 'Symbol', 'Quantity', 'Cost Basis', 'Value', 'Unrealized P/L']
                     st.dataframe(display_pos, use_container_width=True, hide_index=True)
 
             # Trades Analysis
